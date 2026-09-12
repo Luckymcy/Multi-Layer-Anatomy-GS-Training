@@ -91,6 +91,13 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold = 0.0002
         self.inactive_purge_threshold = 0.015
         self.inactive_purge_decay = 0.975
+        # Conservative pruning controls. Defaults preserve the existing
+        # training behavior; layered runs can opt into safer values.
+        self.inactive_purge_from_iter = 0
+        self.prune_from_iter = 0
+        self.min_active_points = 1
+        self.max_prune_fraction = 1.0
+        self.min_opacity = 0.005
         self.random_background = False
         super().__init__(parser, "Optimization Parameters")
 

@@ -150,8 +150,48 @@ def readColmapSceneInfo(path, images, flatten_alpha, eval, llffhold=8):
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     if eval:
-        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
-        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+        train_split_path = os.path.join(path, "train.txt")
+        test_split_path = os.path.join(path, "test.txt")
+        if os.path.isfile(train_split_path) and os.path.isfile(test_split_path):
+            def read_split_names(split_path):
+                with open(split_path, "r", encoding="utf-8") as split_file:
+                    return {
+                        Path(line.strip()).stem
+                        for line in split_file
+                        if line.strip()
+                    }
+
+            train_names = read_split_names(train_split_path)
+            test_names = read_split_names(test_split_path)
+            camera_names = {camera.image_name for camera in cam_infos}
+
+            overlap = train_names & test_names
+            unknown = (train_names | test_names) - camera_names
+            unassigned = camera_names - (train_names | test_names)
+            if overlap:
+                raise ValueError(
+                    f"Camera split overlap in {path}: {sorted(overlap)}"
+                )
+            if unknown:
+                raise ValueError(
+                    f"Camera split references unknown images in {path}: "
+                    f"{sorted(unknown)}"
+                )
+            if unassigned:
+                raise ValueError(
+                    f"Camera split leaves images unassigned in {path}: "
+                    f"{sorted(unassigned)}"
+                )
+
+            train_cam_infos = [c for c in cam_infos if c.image_name in train_names]
+            test_cam_infos = [c for c in cam_infos if c.image_name in test_names]
+            print(
+                f"Using explicit camera split: {len(train_cam_infos)} train, "
+                f"{len(test_cam_infos)} test"
+            )
+        else:
+            train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+            test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
     else:
         train_cam_infos = cam_infos
         test_cam_infos = []

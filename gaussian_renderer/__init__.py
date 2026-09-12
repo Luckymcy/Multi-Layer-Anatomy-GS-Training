@@ -100,7 +100,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     
     # Get subset for actively trained level
     radii_all = radii
-    radii = radii_all.split(pc.get_xyz.shape[0])[0]
+    # Slicing also supports an empty active layer; Tensor.split(0) does not.
+    radii = radii_all[:pc.get_xyz.shape[0]]
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.

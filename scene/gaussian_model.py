@@ -386,6 +386,13 @@ class GaussianModel:
         return optimizable_tensors
 
     def prune_points(self, mask):
+        mask = mask.reshape(-1)
+        # Every pruning path goes through this method. Keep one active Gaussian
+        # so the layer can still receive gradients and recover by densification.
+        if mask.numel() > 0 and bool(mask.all()):
+            most_opaque = torch.argmax(self.get_opacity.squeeze(-1))
+            mask = mask.clone()
+            mask[most_opaque] = False
         valid_points_mask = ~mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
@@ -401,6 +408,33 @@ class GaussianModel:
         self.max_radii2D = self.max_radii2D[valid_points_mask]
 
         self.reset_change_tracking()
+
+    def limit_prune_mask(self, mask, score, min_active_points=1, max_prune_fraction=1.0):
+        """Limit destructive pruning while keeping the best-scoring points.
+
+        `mask` contains pruning candidates and lower `score` values are pruned
+        first. A value of 1/1.0 reproduces the previous keep-one safeguard.
+        """
+        mask = mask.reshape(-1)
+        point_count = mask.numel()
+        if point_count == 0:
+            return mask
+
+        min_active_points = max(1, int(min_active_points))
+        max_prune_fraction = min(1.0, max(0.0, float(max_prune_fraction)))
+        max_by_floor = max(0, point_count - min_active_points)
+        max_by_fraction = int(point_count * max_prune_fraction)
+        candidate_indices = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+        remove_count = min(candidate_indices.numel(), max_by_floor, max_by_fraction)
+
+        if remove_count == candidate_indices.numel():
+            return mask
+        limited_mask = torch.zeros_like(mask)
+        if remove_count > 0:
+            candidate_scores = score.reshape(-1)[candidate_indices]
+            selected = candidate_indices[torch.argsort(candidate_scores)[:remove_count]]
+            limited_mask[selected] = True
+        return limited_mask
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -486,25 +520,37 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size,
+                          do_prune=True, min_active_points=1, max_prune_fraction=1.0):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if do_prune:
+            # Preserve the point dimension when only one Gaussian remains.
+            prune_mask = (self.get_opacity < min_opacity).squeeze(-1)
 
-        if max_screen_size:
-            big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
-        self.prune_points(prune_mask)
+            if max_screen_size:
+                big_points_vs = self.max_radii2D > max_screen_size
+                big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+                prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+            prune_mask = self.limit_prune_mask(
+                prune_mask,
+                self.get_opacity.squeeze(-1),
+                min_active_points,
+                max_prune_fraction,
+            )
+            self.prune_points(prune_mask)
 
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        grad = viewspace_point_tensor.grad.split(self.get_xyz.shape[0])[0]
+        active_count = self.get_xyz.shape[0]
+        if active_count == 0:
+            return
+        grad = viewspace_point_tensor.grad[:active_count]
         self.xyz_gradient_accum[update_filter] += torch.norm(grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
@@ -517,8 +563,15 @@ class GaussianModel:
         total_change = current_change_xyz*2 + current_change_features*0.1 + current_change_scaling*0.1
         self.change += total_change
 
-    def prune_inactive_gaussians(self, threshold):
-        mask = (self.change < threshold).squeeze()
+    def prune_inactive_gaussians(self, threshold, min_active_points=1, max_prune_fraction=1.0):
+        # Preserve the point dimension when only one Gaussian remains.
+        mask = (self.change < threshold).squeeze(-1)
+        mask = self.limit_prune_mask(
+            mask,
+            self.change.squeeze(-1),
+            min_active_points,
+            max_prune_fraction,
+        )
         self.prune_points(mask)
 
     def reset_change_tracking(self):

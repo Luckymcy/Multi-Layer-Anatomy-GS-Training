@@ -151,14 +151,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor_all, visibility_filter)
 
-                if iteration % opt.densification_interval == 0 and inactive_purge_threshold >= 0:
-                    gaussians.prune_inactive_gaussians(inactive_purge_threshold)
+                if (iteration >= opt.inactive_purge_from_iter
+                        and iteration % opt.densification_interval == 0
+                        and inactive_purge_threshold >= 0):
+                    gaussians.prune_inactive_gaussians(
+                        inactive_purge_threshold,
+                        opt.min_active_points,
+                        opt.max_prune_fraction,
+                    )
                     inactive_purge_threshold = inactive_purge_threshold * opt.inactive_purge_decay
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     # What is this number? 20?
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                    gaussians.densify_and_prune(
+                        opt.densify_grad_threshold,
+                        opt.min_opacity,
+                        scene.cameras_extent,
+                        size_threshold,
+                        iteration >= opt.prune_from_iter,
+                        opt.min_active_points,
+                        opt.max_prune_fraction,
+                    )
+
+                if iteration % opt.densification_interval == 0:
+                    print("\n[ITER {}] Active-layer Gaussians: {}".format(
+                        iteration, gaussians.get_xyz.shape[0]))
                 
                 if iteration % opt.opacity_reset_interval == 0 or iteration == opt.densify_from_iter:
                     gaussians.reset_opacity()
