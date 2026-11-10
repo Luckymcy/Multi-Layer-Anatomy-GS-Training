@@ -1,5 +1,20 @@
 # Multi-Layer 3D Gaussian Splatting
 
+## 当前任务模块 / Task-based entry points
+
+根目录以 `run.py` 为统一入口，复用代码按任务分组：
+
+| 任务 | 目录 | 入口示例 |
+| --- | --- | --- |
+| 分层形状、CT教师图拟合 | [geometry/](geometry/README.md) | `python run.py geometry train --help` |
+| 固定结构的LUT外观学习 | [appearance/](appearance/README.md) | `python run.py appearance train --help` |
+| 渲染与指标、层完整性检查 | [evaluation/](evaluation/README.md) | `python run.py evaluation render --help` |
+| 自动化回归测试 | `tests/` | `python -m unittest discover -s tests -v` |
+
+共享基础设施保留为 `scene/`、`gaussian_renderer/`、`arguments/`、`utils/` 和 `lpipsPyTorch/`；CUDA依赖仍在submodules，源码适配见 [patches/README.md](patches/README.md)。旧合成验证、一次性预览、过时启动器和上游硬编码对比驱动已从活动目录移除，保留单元测试和可复用评估工具。当前appearance训练代码已完成短程工程验证及一次5000步的单次手术数据实验，候选真实patch仍待视觉验收，不代表已建立真实域效果。
+
+下方保留原项目说明，常用命令路径已更新为模块形式。
+
 This is the training code for **Multi-Layer Gaussian Splatting for Immersive Anatomy Visualization**. The repository builds on the original code for 3D Gaussian Splatting and reuses most of it. You can find the original readme below. See the other repositories related to this work here: https://github.com/roth-hex-lab/Multi-Layer-Gaussian-Splatting-for-Immersive-Anatomy-Visualization
 
 This work extends the original 3D GS training with a layering approach. Layers function as 3D background during training, and are included in the final point cloud. A viewer can then selectively view and cut through layers to create more enganging views.We add the option to load and saves layers while training. We also improve loading of images with transparent backgrounds, and incorporate the alpha channel in the training process. We further add inactive pruning to remove inactive Gaussians introduced in the layering process.
@@ -12,7 +27,7 @@ Each layer is trainined in its own training run. Consecutive training runs then 
 The installation mostly follows the original 3D GS installation procedure. We further need to apply a patch to add functionality to the `diff-gaussian-rasterization` submodule. 
 
 1. Follow the installation as described below. 
-2. Apply `pyth.diff` with `patch -p < patch.diff` in this folder
+2. Apply the pinned source adaptations documented in `patches/README.md` before building. `patches/upstream_legacy.patch` is retained only as the original historical patch; do not apply both patch sets.
 
 You should be good to go.
 
@@ -164,11 +179,11 @@ Some users experience problems building the submodules on Windows (```cl.exe: Fi
 To run the optimizer, simply use
 
 ```shell
-python train.py -s <path to COLMAP or NeRF Synthetic dataset>
+python -m geometry.train -s <path to COLMAP or NeRF Synthetic dataset>
 ```
 
 <details>
-<summary><span style="font-weight: bold;">Command Line Arguments for train.py</span></summary>
+<summary><span style="font-weight: bold;">Command Line Arguments for geometry.train</span></summary>
 
   #### --source_path / -s
   Path to the source directory containing a COLMAP or Synthetic NeRF data set.
@@ -251,19 +266,19 @@ The MipNeRF360 scenes are hosted by the paper authors [here](https://jonbarron.i
 ### Evaluation
 By default, the trained models use all available images in the dataset. To train them while withholding a test set for evaluation, use the ```--eval``` flag. This way, you can render training/test sets and produce error metrics as follows:
 ```shell
-python train.py -s <path to COLMAP or NeRF Synthetic dataset> --eval # Train with train/test split
-python render.py -m <path to trained model> # Generate renderings
-python metrics.py -m <path to trained model> # Compute error metrics on renderings
+python -m geometry.train -s <path to COLMAP or NeRF Synthetic dataset> --eval # Train with train/test split
+python -m evaluation.render -m <path to trained model> # Generate renderings
+python -m evaluation.metrics -m <path to trained model> # Compute error metrics on renderings
 ```
 
 If you want to evaluate our [pre-trained models](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/pretrained/models.zip), you will have to download the corresponding source data sets and indicate their location to ```render.py``` with an additional ```--source_path/-s``` flag. Note: The pre-trained models were created with the release codebase. This code base has been cleaned up and includes bugfixes, hence the metrics you get from evaluating them will differ from those in the paper.
 ```shell
-python render.py -m <path to pre-trained model> -s <path to COLMAP dataset>
-python metrics.py -m <path to pre-trained model>
+python -m evaluation.render -m <path to pre-trained model> -s <path to COLMAP dataset>
+python -m evaluation.metrics -m <path to pre-trained model>
 ```
 
 <details>
-<summary><span style="font-weight: bold;">Command Line Arguments for render.py</span></summary>
+<summary><span style="font-weight: bold;">Command Line Arguments for evaluation.render</span></summary>
 
   #### --model_path / -m 
   Path to the trained model directory you want to create renderings for.
@@ -294,7 +309,7 @@ python metrics.py -m <path to pre-trained model>
 </details>
 
 <details>
-<summary><span style="font-weight: bold;">Command Line Arguments for metrics.py</span></summary>
+<summary><span style="font-weight: bold;">Command Line Arguments for evaluation.metrics</span></summary>
 
   #### --model_paths / -m 
   Space-separated list of model paths for which metrics should be computed.
@@ -486,7 +501,7 @@ For rasterization, the camera models must be either a SIMPLE_PINHOLE or PINHOLE 
 ```
  If you have COLMAP and ImageMagick on your system path, you can simply run 
 ```shell
-python convert.py -s <location> [--resize] #If not resizing, ImageMagick is not needed
+python -m geometry.prepare_colmap -s <location> [--resize] #If not resizing, ImageMagick is not needed
 ```
 Alternatively, you can use the optional parameters ```--colmap_executable``` and ```--magick_executable``` to point to the respective paths. Please note that on Windows, the executable should point to the COLMAP ```.bat``` file that takes care of setting the execution environment. Once done, ```<location>``` will contain the expected COLMAP data set structure with undistorted, resized input images, in addition to your original images and some temporary (distorted) data in the directory ```distorted```.
 
@@ -505,7 +520,7 @@ If you have your own COLMAP dataset without undistortion (e.g., using ```OPENCV`
 ```
 Then run 
 ```shell
-python convert.py -s <location> --skip_matching [--resize] #If not resizing, ImageMagick is not needed
+python -m geometry.prepare_colmap -s <location> --skip_matching [--resize] #If not resizing, ImageMagick is not needed
 ```
 
 <details>

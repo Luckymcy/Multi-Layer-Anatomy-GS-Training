@@ -1,0 +1,12 @@
+{
+  "anchor_color_space": "srgb",
+  "initialization_source": "Unity DefaultForLayer(7) numeric anchors interpreted as sRGB; no SH lighting modulation on selected tissue",
+  "tissues": [
+    {
+      "name": "fat",
+      "layer": 7,
+      "hu_range": [-190, 50],
+      "anchors": [[-122, 0.68, 0.52, 0.33], [-79, 0.84, 0.72, 0.50], [-13, 0.95, 0.86, 0.68]]
+    }
+  ]
+}

@@ -2,7 +2,7 @@
 import io
 import unittest
 import torch
-from appearance_lut import TissueRGBLUT, srgb_to_linear, linear_to_srgb
+from appearance.lut import TissueRGBLUT, srgb_to_linear, linear_to_srgb
 
 
 class LUTTests(unittest.TestCase):

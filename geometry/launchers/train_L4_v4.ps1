@@ -1,12 +1,15 @@
 param(
     [string]$Python = "C:\ProgramData\Anaconda3\envs\mld\python.exe",
-    [string]$Workspace = (Split-Path -Parent $PSScriptRoot),
+    [string]$Workspace = "",
     [string]$Output = ""
 )
 
 $ErrorActionPreference = "Stop"
 
-$Repo = $PSScriptRoot
+$Repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+if (-not $Workspace) {
+    $Workspace = Split-Path -Parent $Repo
+}
 $Source = Join-Path $Workspace "data\ct\teachers\v4\L4"
 $PreviousLayer = Join-Path $Workspace "output\L3_v3\layer_save_30000.pth"
 if (-not $Output) {
@@ -25,7 +28,7 @@ if (Test-Path -LiteralPath $Output) {
 
 Set-Location -LiteralPath $Repo
 
-& $Python train.py `
+& $Python -m geometry.train `
     -s $Source `
     -m $Output `
     --load_layer $PreviousLayer `

@@ -1,6 +1,4 @@
 *.pyc
-# Local handoff and machine-specific experiment notes
-/experiments/README_lut.md
 .vscode
 output
 build
