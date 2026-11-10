@@ -1,0 +1,12 @@
+{
+  "anchor_color_space": "srgb",
+  "initialization_source": "Unity HUTransferSettings.DefaultForLayer(4); numeric colors interpreted as sRGB for this experiment, not a verified Unity framebuffer match",
+  "tissues": [
+    {
+      "name": "myocardium_layer_proxy",
+      "layer": 4,
+      "hu_range": [-40, 310],
+      "anchors": [[-40, 0.58, 0.38, 0.14], [93, 0.48, 0.14, 0.11], [310, 0.72, 0.20, 0.13]]
+    }
+  ]
+}

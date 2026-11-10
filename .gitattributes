@@ -1,0 +1,3 @@
+# Unified diffs contain literal upstream context whitespace. Preserve LF so the
+# patches apply on fresh Windows checkouts as well as on Unix.
+*.patch text eol=lf -whitespace
