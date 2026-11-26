@@ -1,0 +1,4 @@
+{
+  "initialization_source": "Source model SH DC when --rgb-initialization sh-dc; this configuration identifies the target tissue only",
+  "tissues": [{"name": "myocardium", "layer": 4}]
+}

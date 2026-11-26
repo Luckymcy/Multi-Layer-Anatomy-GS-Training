@@ -1,5 +1,35 @@
 # Appearance-only LUT training
 
+## Non-adversarial L4 initial validation
+
+### Optional CT surface-neighbor regularization
+
+`appearance/surface_graph.py` builds a fixed graph for one layer in the source PLY row order. An explicit physical-LPS/mm CT mesh provides nearest-surface vertices and consistently oriented normals. Candidate Gaussian KNN edges must satisfy a 2.5 mm Euclidean radius, 1.5 mm maximum Gaussian-to-surface distance, <=45 degree surface-normal angle, and <=2.5 mm path length along actual mesh triangle edges. Bounded Dijkstra rejects connections across nearby but geodesically distant folds. These are CT surface priors, not verified Gaussian anatomical connectivity; no PCA normal or zero PLY normal is silently substituted.
+
+The optional loss is `sum_e w_e * mean_RGB(smooth_L1(c_i-c_j, beta=delta)) / sum_e w_e`, where `w_e=exp(-0.5*(geodesic_distance/radius)^2)` and default delta is 0.05 linear RGB. It regularizes final colors, not PLY index adjacency or geometry. Unmapped/isolated Gaussians get no graph gradient. All graph edges/weights are fixed buffers. A constant color gives zero loss; graph-size normalization keeps loss scale independent of edge count. Strong weights can oversmooth real texture, so 0.1 is only an initial trial value.
+
+Prepare a mesh with the separate SimpleITK/VTK environment (workspace root):
+
+```powershell
+& C:/ProgramData/Anaconda3/envs/heart-teachers/python.exe tools/training/extract_ct_surface.py --mask data/ct/masks/total_free/heart.nii.gz --output archive/2026-11-20/L4_surface_regularization/ct_surface.npz
+```
+
+Then from this training repository with the existing PyTorch/SciPy environment:
+
+```powershell
+python -m appearance.surface_graph --ply ../output/geometry/L7_v4/point_cloud/iteration_30000/point_cloud_hu.ply --surface ../archive/2026-11-20/L4_surface_regularization/ct_surface.npz --output ../archive/2026-11-20/L4_surface_regularization/l4_graph.npz
+```
+
+Add `--surface-graph PATH --surface-weight 0.1 --surface-huber-delta 0.05` to `appearance color-distribution`. Weight defaults to zero, preserving the previous baseline. Providing the graph with weight zero records its diagnostic while retaining identical baseline updates. Graphs bind to the exact source model SHA256 and selected PLY rows; regenerate if the source changes. Checkpoints include graph buffers and metadata, and reports include initial/final loss and the separate graph gradient. The graph is not wired into the GAN entry point in this first experiment.
+
+Current graph: 164,979 edges covering 38,445/58,289 L4 Gaussians. The original teacher's L4 outer-mask path is unavailable; this graph uses the existing CT whole-heart mask as an approximate prior, with a strict distance gate. Do not enlarge the mapping threshold just to force full coverage. `tests/test_surface_graph.py` checks folds, normals, disconnected color components, isolated points, normalized loss and model-bound reload.
+
+`python run.py appearance color-distribution --labeling ../data/real/L4_heartmuscle/labeling --ply ../output/geometry/L4_v4/point_cloud/iteration_30000/point_cloud_hu.ply --cameras ../output/geometry/L4_v4/cameras.json --output ../output/appearance/l4/gaussian_train/new_validation --steps 8`
+
+This separate entry point reads myocardium/exclude polygons directly, samples masked pixels without patches, and optimizes independent L4 linear RGB using mean/covariance and 32-direction sliced Wasserstein squared distance. Geometry, opacity and source SH stay frozen; selected-layer SH is replaced by view-independent RGB initialized from source SH DC (historical values assumed linear). The data-only gradient is checked separately from the weak initialization anchor. Fixed-sample before/after losses use the same random pixels and projections. Masks retain the existing 0.95 contribution/alpha and 0.98 purity thresholds under all-layer occlusion. Real masks are eroded by two pixels and heuristic bright pixels are excluded. Other blood/vessels/sutures still require manual exclusion.
+
+By default limited to 1–20 engineering steps. Explicit `--long-run --steps 5000 --lr 0.001 --train-split PATH --test-split PATH` enables longer experiments with exact geometry train/test camera matching. All requested training cameras are screened, eligible views shuffle without replacement, and real frames are independently sampled uniformly. Without splits, 24 evenly spaced cameras are screened. There is no discriminator, spatial-neighbor regularizer, texture correspondence, or claim of realism/generalization. The default learning rate is 0.001. `gaussian_colors.pt` exports the model-bound `gaussian-linear-rgb-v1` color format supported by `tools/training/export_gaussian_rgb.py`; it is not a PLY. Periodic `latest_checkpoint.pt` also saves optimizer and RNG state, but a production resume CLI is not implemented. Source and annotation hashes, configuration, gradients, fixed-view images and frozen-field verification are recorded in `report.json` and adjacent outputs. Fixed-view losses use training cameras, not independent real validation.
+
 This package is separate from `geometry/train.py` and never configures a Gaussian optimizer. The adversarial entry point is `appearance/train.py` and learns **one tissue LUT**, currently using the L7/fat example. Geometry and all original SH parameters stay frozen; selected-tissue RGB replaces SH and other tissues keep fixed SH context.
 
 ```text
@@ -18,6 +48,22 @@ tests/test_adversarial_appearance.py
 ```
 
 ## Inputs and color contract
+
+### Independent Gaussian RGB baseline
+
+L4 results live under `output/appearance/l4/guassian_train/` (non-adversarial) and `output/appearance/l4/gan_train/` (GAN). Keep only comparison.jpg, result.json and trained_l7.ply in each final result directory; checkpoints and detailed logs live in archive. L4 and L7 result roots identify the optimized tissue, not the highest layer in the source PLY. The updated low-glare L4 dataset has 75 native 32px patches covering all five annotated frames; 64px only covers three frames. `--patch-size 32` is supported by the existing discriminator; larger default sizes remain unchanged. This scale change must be recorded when comparing runs.
+
+For L4 myocardium GAN comparison, use `--config appearance/configs/myocardium_l4.json --appearance-mode gaussian-rgb --rgb-initialization sh-dc --color-lr 0.001 --anchor-weight 0.01`. This matches the non-adversarial run's stored-DC initialization and bypasses selected-layer high-order SH; no HU LUT is used. The target-only myocardium config is not a valid LUT config. Default RGB initialization remains the manual LUT for older experiments. `--log-every 250` reduces console output while preserving every-step metrics. Current L4 data has 25 safe 64px patches from four annotated frames; 163/165 train cameras pass complete-patch screening at width 2048, with the same visibility thresholds. These candidates remain explicitly unreviewed and are used as an experiment, not certified tissue ground truth.
+
+To use the same camera split as geometry training, supply `--train-split ../data/ct/teachers/v4/L7/train.txt --test-split ../data/ct/teachers/v4/L7/test.txt --view-order shuffle` instead of `--view-indices`. Names are matched to cameras.json (whose order includes test cameras); exact split matching and disjointness are required. All train cameras are screened using the existing visibility thresholds; cameras without a complete eligible patch are logged and skipped. Eligible views are shuffled without replacement each epoch, deterministically from seed/absolute step for reproducible resume. Test cameras never enter the loss. The report distinguishes requested, eligible, skipped and held-out view counts. A fresh run is required when changing splits or ordering.
+
+Store independent RGB runs under `output/appearance/l7/guassian_train/` (workspace root). From this training repository, pass `--output ../output/appearance/l7/guassian_train/run_001`, choosing a new run subdirectory each time. LUT outputs remain separate under `output/appearance/l7/lut_train/`.
+
+Use `--appearance-mode gaussian-rgb --color-lr 0.001` with the same input/view/data options below. This creates one sigmoid-parameterized linear RGB triplet per selected-layer Gaussian, initialized from the manual LUT, and then optimizes the colors independently. HU is used only for initialization, never for the learned color mapping. Identical HU values can learn different colors. This is view-independent RGB, not optimization of higher-order SH or Gaussian geometry. All stored source SH fields remain frozen and are bypassed on the selected layer.
+
+The discriminator, patch sampling, occlusion tests and GAN losses are shared with the LUT baseline. `--smooth-weight` has no effect in RGB mode (effective weight zero): adjacency in PLY order is not spatial adjacency. `--anchor-weight` optionally constrains colors to their initialization. There is currently no surface-neighbor regularizer. Invisible/unobserved Gaussians are not guaranteed to change; the report records how many colors changed. Dataset acceptance and physical-scale limitations still apply.
+
+Final RGB output is `gaussian_colors.pt`, with original PLY row indices, source model hash, layer and linear RGB values. It is bound to this exact model; it is not a HU LUT JSON and cannot be loaded through Unity's LUT JSON interface. Full resumable state is also saved. The shared checkpoint/metric field names retain the legacy `lut` prefix for compatibility; `appearance_mode` in config/signature/report distinguishes the representations and prevents cross-mode resume. LUT curve JSON files are not emitted in RGB mode. The LUT-specific summary plotting tool should not be used for this mode.
 
 Supply a Gaussian PLY with `layer` and `hu`, its `cameras.json`, and a prepared `patch_manifest.json` with `summary.json` in the same directory. The real loader selects one tissue and one native patch size, verifies checksums, source image/annotation checksums and dimensions, and samples frames uniformly before sampling their patches. It refuses evaluation splits and does not resize real images.
 
@@ -58,7 +104,7 @@ Use the training repository as working directory. Dependencies are the existing 
 python -m unittest discover -s tests -v
 
 # Three-step engineering check. Explicitly acknowledges pending dataset review.
-python run.py appearance train --ply ../output/L7_v4/point_cloud/iteration_30000/point_cloud_hu.ply --cameras ../output/L7_v4/cameras.json --real-manifest ../data/real/surgery_001/training_dataset/v001/patch_manifest.json --output ../output/appearance/l7/new_smoke_run --steps 3 --patch-size 64 --render-width 2048 --view-indices 0 20 80 120 140 --d-channels 16 --smoke-test --allow-unreviewed-data
+python run.py appearance train --ply ../output/geometry/L7_v4/point_cloud/iteration_30000/point_cloud_hu.ply --cameras ../output/geometry/L7_v4/cameras.json --real-manifest ../data/real/L7_fat/train/patch_manifest.json --output ../output/appearance/l7/new_smoke_run --steps 3 --patch-size 64 --render-width 2048 --view-indices 0 20 80 120 140 --d-channels 16 --smoke-test --allow-unreviewed-data
 ```
 
 The default total step count is 10; `--smoke-test` is limited to <=5 total steps. Output must be new. The dataset summary must have `training_ready=true` for normal use; `--allow-unreviewed-data` explicitly records a departure from that status and never edits it. An engineering smoke run is not acceptance of the tissue labels or evidence of realism. No long run is started by importing or installing this package.

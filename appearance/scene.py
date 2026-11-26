@@ -120,6 +120,27 @@ class FrozenGaussianScene:
         colors = view['context'].index_copy(0, self.indices, lut(self.hu, self.tissue_rows))
         return self._render(view['camera'], colors)['render']
 
+    def prepare_pixel_views(self, indices, width, purity=.98, minimum_weight=.95, margin=2):
+        """Occlusion-aware masks without requiring a complete square patch."""
+        indicator = torch.zeros_like(self.pc.get_xyz).index_fill(0, self.indices, 1.)
+        with torch.no_grad():
+            for index in indices:
+                camera = load_camera(self.camera_entries[index], width, self.pc.get_xyz)
+                weights = self._render(camera, indicator)
+                # A large box avoids enumerating per-pixel boxes; only mask is used.
+                _, valid = eligible_boxes(weights['render'][0], weights['accumulation'],
+                    max(camera.image_width, camera.image_height) + 1,
+                    purity, minimum_weight, margin)
+                count = int(valid.sum())
+                self.coverage.append({'camera_index': index, 'valid_pixels': count})
+                if count < 32:
+                    continue
+                direction = torch.nn.functional.normalize(self.pc.get_xyz-camera.camera_center, dim=-1)
+                context = (eval_sh(self.pc.max_sh_degree, self.pc.get_features.transpose(1, 2), direction)+.5).clamp_min(0)
+                self.views.append({'index': index, 'camera': camera, 'context': context,
+                                   'mask': valid})
+        return self.coverage
+
     def original(self, view):
         return self._render(view['camera'])['render']
 

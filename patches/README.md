@@ -22,4 +22,6 @@ The rasterizer patch lowers the hard-coded near culling distance from 0.2 to 0.0
 
 **Important limitation:** the existing patch's custom backward does not propagate a gradient from the extra accumulation output. The fixed-structure LUT validator optimizes RGB image loss and does not depend on that gradient. This patch is a record of the working local interface, not a completed differentiable-alpha implementation. Any alpha-only objective requires separate backward support and validation.
 
+`geometry.refine_local` now avoids that limitation by rendering constant white Gaussian colors on a black background and using one RGB channel as alpha. Its CUDA regression test checks forward equivalence with accumulation and nonzero opacity/scale gradients. Historical local-refinement models produced before this correction retain their original reported metrics; their computed accumulation-loss term had no optimization effect. Other legacy training entry points are not changed by this workaround.
+
 Compiler compatibility overrides do not establish support for arbitrary CUDA/MSVC combinations. The local RGB gradient checks used PyTorch 1.12/CUDA 11.3 and an RTX 2080 Ti; a different environment must run its own validation. No CUDA rebuild or long training is performed merely by checking out these patches.

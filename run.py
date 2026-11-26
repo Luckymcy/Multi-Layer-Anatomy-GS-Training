@@ -7,8 +7,8 @@ import sys
 COMMANDS = {
     'geometry': {'train': 'geometry.train', 'refine-surface': 'geometry.refine_surface',
                  'refine-scales': 'geometry.refine_scales', 'export-base': 'geometry.export_base',
-                 'prepare-colmap': 'geometry.prepare_colmap'},
-    'appearance': {'train': 'appearance.train'},
+                 'prepare-colmap': 'geometry.prepare_colmap', 'refine-local': 'geometry.refine_local'},
+    'appearance': {'train': 'appearance.train', 'color-distribution': 'appearance.color_distribution'},
     'evaluation': {'render': 'evaluation.render', 'metrics': 'evaluation.metrics',
                    'verify-layers': 'evaluation.verify_layers'},
 }

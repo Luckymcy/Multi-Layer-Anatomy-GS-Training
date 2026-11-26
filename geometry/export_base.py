@@ -15,7 +15,9 @@ from utils.graphics_utils import getWorld2View2, getProjectionMatrix, focal2fov
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', required=True)
+    parser.add_argument('--model')
+    parser.add_argument('--ply', help='Full model file instead of model directory')
+    parser.add_argument('--exclude-layer', type=int)
     parser.add_argument('--teachers', required=True)
     parser.add_argument('--output', required=True)
     parser.add_argument('--scale', type=int, default=2)
@@ -26,7 +28,14 @@ def main():
     extrinsics = read_extrinsics_text(str(source / 'sparse/0/images.txt'))
     intrinsics = read_intrinsics_text(str(source / 'sparse/0/cameras.txt'))
     model = GaussianModel(3)
-    model.load_ply(str(Path(args.model) / 'point_cloud/iteration_30000/point_cloud.ply'))
+    model_path = Path(args.ply) if args.ply else Path(args.model) / 'point_cloud/iteration_30000/point_cloud.ply'
+    model.load_ply(str(model_path))
+    if args.exclude_layer is not None:
+        from plyfile import PlyData
+        labels = PlyData.read(str(model_path))['vertex'].data['layer']
+        keep = torch.tensor(labels != args.exclude_layer, device='cuda')
+        for key in ('_xyz','_scaling','_rotation','_opacity','_features_dc','_features_rest'):
+            setattr(model,key,torch.nn.Parameter(getattr(model,key)[keep].detach(),requires_grad=False))
     pipeline = SimpleNamespace(compute_cov3D_python=False, convert_SHs_python=False, debug=False)
     background = torch.zeros(3, device='cuda')
     records = []

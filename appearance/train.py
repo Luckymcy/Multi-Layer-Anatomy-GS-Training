@@ -1,4 +1,4 @@
-"""Unpaired real-patch guidance for a single frozen Gaussian tissue LUT.
+"""Unpaired real-patch guidance for a frozen Gaussian tissue's LUT or independent RGB.
 
 This independent entry point never calls geometry.train or a Gaussian optimizer.
 """
@@ -12,7 +12,9 @@ import numpy as np
 from PIL import Image
 import torch
 
-from appearance.lut import from_manual_config
+from appearance.lut import from_manual_config, srgb_to_linear
+from appearance.gaussian_rgb import GaussianRGB
+from appearance.views import split_view_indices, epoch_view_index
 from appearance.discriminator import TissuePatchDiscriminator
 from appearance.patches import RealPatchBank, crop_render, file_hash
 from appearance.scene import FrozenGaussianScene, save_rgb
@@ -29,9 +31,16 @@ def parse_args():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--steps', type=int, default=10, help='Total completed steps, including resumed steps')
     parser.add_argument('--knots', type=int, choices=[16, 32], default=16)
-    parser.add_argument('--patch-size', type=int, choices=[64, 96, 128], default=64)
+    parser.add_argument('--appearance-mode', choices=['lut', 'gaussian-rgb'], default='lut')
+    parser.add_argument('--rgb-initialization', choices=['lut', 'sh-dc'], default='lut')
+    parser.add_argument('--color-lr', type=float, default=.001, help='Independent Gaussian RGB learning rate')
+    parser.add_argument('--source-color-space',choices=['legacy-linear','srgb'],default='legacy-linear')
+    parser.add_argument('--patch-size', type=int, choices=[32, 64, 96, 128], default=64)
     parser.add_argument('--render-width', type=int, default=2048)
-    parser.add_argument('--view-indices', nargs='+', type=int, default=[0, 20, 40, 60, 80, 100, 120, 140, 160])
+    parser.add_argument('--view-indices', nargs='+', type=int)
+    parser.add_argument('--train-split', type=Path)
+    parser.add_argument('--test-split', type=Path)
+    parser.add_argument('--view-order', choices=['cycle', 'shuffle'], default='cycle')
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--minimum-tissue-purity', type=float, default=.98)
     parser.add_argument('--minimum-tissue-weight', type=float, default=.95)
@@ -42,13 +51,16 @@ def parse_args():
     parser.add_argument('--smooth-weight', type=float, default=.001)
     parser.add_argument('--anchor-weight', type=float, default=0.)
     parser.add_argument('--save-every', type=int, default=50)
+    parser.add_argument('--log-every', type=int, default=1)
     parser.add_argument('--preview-every', type=int, default=0, help='Periodic preview interval; zero saves start/final only')
     parser.add_argument('--seed', type=int, default=20261110)
     parser.add_argument('--resume', type=Path)
     parser.add_argument('--allow-unreviewed-data', action='store_true')
     parser.add_argument('--smoke-test', action='store_true', help='Engineering check limited to <=5 total steps')
     args = parser.parse_args()
-    if args.steps < 1 or args.batch_size < 1 or args.save_every < 1:
+    if bool(args.train_split) != bool(args.test_split) or (args.train_split and args.view_indices is not None):
+        parser.error('Supply both train/test splits, or explicit indices, never both')
+    if args.steps < 1 or args.batch_size < 1 or args.save_every < 1 or args.log_every < 1:
         parser.error('Steps/batch size/save interval must be positive')
     if args.preview_every < 0:
         parser.error('Preview interval must be nonnegative')
@@ -56,7 +68,7 @@ def parse_args():
         parser.error('Invalid render size or margin')
     if not 0 < args.minimum_tissue_purity <= 1 or not 0 < args.minimum_tissue_weight <= 1:
         parser.error('Visibility thresholds must be in (0,1]')
-    if min(args.lut_lr, args.d_lr) <= 0 or min(args.smooth_weight, args.anchor_weight) < 0:
+    if min(args.lut_lr, args.color_lr, args.d_lr) <= 0 or min(args.smooth_weight, args.anchor_weight) < 0:
         parser.error('Invalid learning rate or regularization weight')
     if args.smoke_test and args.steps > 5:
         parser.error('Smoke validation is limited to five total steps')
@@ -80,22 +92,46 @@ def main():
     spec = config['tissues'][0]
     bank = RealPatchBank(args.real_manifest, args.patch_size, spec['name'], 'cuda', args.allow_unreviewed_data)
     scene = FrozenGaussianScene(args.ply, args.cameras, spec['layer'])
-    lut = from_manual_config(config, args.knots).cuda()
+    def make_appearance():
+        if args.appearance_mode == 'gaussian-rgb' and args.rgb_initialization == 'sh-dc':
+            rgb=(scene.pc._features_dc[scene.indices, 0] * .28209479177387814 + .5).clamp(0, 1)
+            if args.source_color_space=='srgb': rgb=srgb_to_linear(rgb)
+            return GaussianRGB(rgb).cuda()
+        manual = from_manual_config(config, args.knots).cuda()
+        if args.appearance_mode == 'lut':
+            return manual
+        with torch.no_grad():
+            rgb = manual(scene.hu, scene.tissue_rows)
+        return GaussianRGB(rgb).cuda()
+
+    lut = make_appearance()
+    appearance_lr = args.lut_lr if args.appearance_mode == 'lut' else args.color_lr
+    smooth_weight = args.smooth_weight if args.appearance_mode == 'lut' else 0.
     discriminator = TissuePatchDiscriminator(1, args.d_channels).cuda()
-    lut_optimizer = torch.optim.Adam(lut.parameters(), lr=args.lut_lr)
+    lut_optimizer = torch.optim.Adam(lut.parameters(), lr=appearance_lr)
     d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=args.d_lr, betas=(0., .99))
     if {id(p) for g in lut_optimizer.param_groups for p in g['params']} != {id(lut.logits)}:
         raise RuntimeError('Unexpected LUT optimizer parameters')
     initial_rgb = lut.rgb.detach().clone()
     args.output.mkdir(parents=True, exist_ok=False)
-    coverage = scene.prepare_views(args.view_indices, args.render_width, args.patch_size,
+    test_indices = []
+    if args.train_split:
+        view_indices, test_indices = split_view_indices(scene.camera_entries, args.train_split, args.test_split)
+    else:
+        view_indices = args.view_indices if args.view_indices is not None else [0, 20, 40, 60, 80, 100, 120, 140, 160]
+    print(json.dumps({'phase': 'prepare_views', 'requested_train_views': len(view_indices), 'held_out_test_views': len(test_indices)}), flush=True)
+    coverage = scene.prepare_views(view_indices, args.render_width, args.patch_size,
                                   args.minimum_tissue_purity, args.minimum_tissue_weight, args.mask_margin)
+    if args.source_color_space=='srgb':
+        for view in scene.views: view['context']=srgb_to_linear(view['context'].clamp(0,1))
     (args.output/'view_coverage.json').write_text(json.dumps(coverage, indent=2), encoding='utf-8')
     if not scene.views:
         raise RuntimeError('No fully visible target-tissue patches. Inspect view_coverage.json; adjust view/resolution rather than silently lowering tissue purity.')
     immutable_options = {k: v for k,v in vars(args).items() if k not in
-                         {'output', 'steps', 'resume', 'save_every', 'preview_every', 'ply', 'cameras', 'real_manifest', 'config'}}
+                         {'output', 'steps', 'resume', 'save_every', 'preview_every', 'ply', 'cameras', 'real_manifest', 'config', 'train_split', 'test_split'}}
     signature = {'model_sha256': scene.model_hash, 'camera_sha256': scene.camera_hash,
+                 'camera_splits': {'train': file_hash(args.train_split), 'test': file_hash(args.test_split)} if args.train_split else None,
+                 'requested_train_indices': view_indices, 'held_out_test_indices': test_indices,
                  'real_data': bank.signature, 'lut_config': config, 'options': immutable_options,
                  'eligible_views': [(v['index'], len(v['boxes'])) for v in scene.views],
                  'implementation': {p.name: file_hash(p) for p in sorted(Path(__file__).parent.glob('*.py'))},
@@ -112,6 +148,7 @@ def main():
                        'gpu': torch.cuda.get_device_name(), 'start_step': step,
                        'dataset_review_accepted': bank.accepted,
                        'scope': 'engineering_smoke_only' if args.smoke_test else 'single-tissue_unpaired_experiment'})
+    print(json.dumps({'phase': 'training', 'eligible_train_views': len(scene.views), 'skipped_train_views': len(view_indices)-len(scene.views)}), flush=True)
     (args.output/'config.json').write_text(json.dumps(config_out, indent=2), encoding='utf-8')
     previews = scene.views[:min(3, len(scene.views))]
     (args.output/'previews').mkdir()
@@ -126,8 +163,8 @@ def main():
     last_checkpoint, last_fake, last_real, last_tissue = None, None, None, None
     with (args.output/'metrics.jsonl').open('w', encoding='utf-8') as log:
         for current in range(step+1, args.steps+1):
-            # Cycle available views so even a short run exercises shared 3D appearance.
-            view = scene.views[(current-1) % len(scene.views)]
+            selected_view = epoch_view_index(current, len(scene.views), args.seed) if args.view_order == 'shuffle' else (current-1) % len(scene.views)
+            view = scene.views[selected_view]
             picks = rng.choice(len(view['boxes']), size=args.batch_size,
                                replace=len(view['boxes']) < args.batch_size).tolist()
             boxes = [view['boxes'][i] for i in picks]
@@ -136,7 +173,7 @@ def main():
             real, real_indices = bank.sample(args.batch_size, rng)
             tissue = torch.zeros(args.batch_size, dtype=torch.long, device='cuda')
             values = gan_step(lut, discriminator, lut_optimizer, d_optimizer, real, fake, tissue,
-                              args.smooth_weight, initial_rgb, args.anchor_weight,
+                              smooth_weight, initial_rgb, args.anchor_weight,
                               check_adversarial_gradient=current == step+1)
             values.update({'step': current, 'camera_index': view['index'], 'boxes_xyxy': boxes,
                            'real_patch_ids': [bank.rows[i]['id'] for i in real_indices],
@@ -145,17 +182,19 @@ def main():
             log.write(json.dumps(values)+'\n')
             log.flush()
             last_fake, last_real, last_tissue = fake.detach(), real.detach(), tissue
-            print(json.dumps({k: values[k] for k in ['step', 'camera_index', 'd_loss', 'g_adversarial', 'lut_gradient_norm']}), flush=True)
+            if current == step+1 or current % args.log_every == 0 or current == args.steps:
+                print(json.dumps({k: values[k] for k in ['step', 'camera_index', 'd_loss', 'g_adversarial', 'lut_gradient_norm']}), flush=True)
             if current % args.save_every == 0 or current == args.steps:
                 scene.verify_frozen()
                 bank.verify_unchanged()
                 last_checkpoint = args.output/f'checkpoint_{current:06d}.pt'
                 save_checkpoint(last_checkpoint, current, lut, discriminator, lut_optimizer, d_optimizer,
                                 initial_rgb, signature, rng, history)
-                live_curves = {'step': current, 'hu': lut.hu_knots.detach().cpu().tolist(),
-                               'initial_linear_rgb': initial_rgb.cpu().tolist(),
-                               'final_linear_rgb': lut.rgb.detach().cpu().tolist()}
-                (args.output/'lut_curves_latest.json').write_text(json.dumps(live_curves, indent=2), encoding='utf-8')
+                if args.appearance_mode == 'lut':
+                    live_curves = {'step': current, 'hu': lut.hu_knots.detach().cpu().tolist(),
+                                   'initial_linear_rgb': initial_rgb.cpu().tolist(),
+                                   'final_linear_rgb': lut.rgb.detach().cpu().tolist()}
+                    (args.output/'lut_curves_latest.json').write_text(json.dumps(live_curves, indent=2), encoding='utf-8')
             if args.preview_every and (current % args.preview_every == 0 or current == args.steps):
                 with torch.no_grad():
                     for fixed_view in previews:
@@ -172,9 +211,9 @@ def main():
         save_rgb(args.output/'previews/real_patch_example.png', last_real[0])
         save_rgb(args.output/'previews/generated_patch_last_step.png', last_fake[0])
     # Reconstruct models/optimizers and verify saved tensors and rendered output.
-    check_lut = from_manual_config(config, args.knots).cuda()
+    check_lut = make_appearance()
     check_d = TissuePatchDiscriminator(1, args.d_channels).cuda()
-    check_g_optimizer = torch.optim.Adam(check_lut.parameters(), lr=args.lut_lr)
+    check_g_optimizer = torch.optim.Adam(check_lut.parameters(), lr=appearance_lr)
     check_d_optimizer = torch.optim.Adam(check_d.parameters(), lr=args.d_lr, betas=(0., .99))
     restored = restore_checkpoint(last_checkpoint, check_lut, check_d, check_g_optimizer, check_d_optimizer,
                                   signature, np.random.default_rng())
@@ -187,24 +226,38 @@ def main():
     with torch.no_grad():
         torch.testing.assert_close(scene.draw(previews[0], lut), scene.draw(previews[0], check_lut), rtol=0, atol=0)
         torch.testing.assert_close(discriminator(last_fake, last_tissue), check_d(last_fake, last_tissue), rtol=0, atol=0)
-    curves = {'hu': lut.hu_knots.detach().cpu().tolist(), 'initial_linear_rgb': initial_rgb.cpu().tolist(),
-              'final_linear_rgb': lut.rgb.detach().cpu().tolist()}
-    (args.output/'lut_curves.json').write_text(json.dumps(curves, indent=2), encoding='utf-8')
+    if args.appearance_mode == 'lut':
+        curves = {'hu': lut.hu_knots.detach().cpu().tolist(), 'initial_linear_rgb': initial_rgb.cpu().tolist(),
+                  'final_linear_rgb': lut.rgb.detach().cpu().tolist()}
+        (args.output/'lut_curves.json').write_text(json.dumps(curves, indent=2), encoding='utf-8')
+    else:
+        torch.save({'format': 'gaussian-linear-rgb-v1', 'model_sha256': scene.model_hash,
+                    'layer': scene.layer, 'ply_row_indices': scene.indices.cpu(),
+                    'initial_linear_rgb': initial_rgb.cpu(), 'linear_rgb': lut.rgb.detach().cpu()},
+                   args.output/'gaussian_colors.pt')
     report = {'scope': config_out['scope'], 'completed_steps': args.steps, 'start_step': step,
               'eligible_views': len(scene.views), 'real_patches': len(bank.rows),
-              'real_source_frames': len(bank.groups), 'layer': spec['layer'], 'knots': args.knots,
+              'requested_train_views': len(view_indices), 'held_out_test_views': len(test_indices),
+              'skipped_train_views': len(view_indices)-len(scene.views), 'view_order': args.view_order,
+              'real_source_frames': len(bank.groups), 'layer': spec['layer'],
+              'appearance_mode': args.appearance_mode,
+              'knots': args.knots if args.appearance_mode == 'lut' else None,
+              'learnable_rgb_parameters': lut.logits.numel(),
+              'effective_smooth_weight': smooth_weight,
               'dataset_review_accepted': bank.accepted, 'allow_unreviewed_data': args.allow_unreviewed_data,
               'model_fields_bitwise_unchanged': True, 'model_and_real_input_hashes_unchanged': True,
               'checkpoint_model_optimizer_render_roundtrip': True,
               'max_rgb_control_change_this_run': changed,
+              'changed_gaussians_this_run': int(((lut.rgb.detach()-start_rgb).abs().max(dim=-1).values > 0).sum()) if args.appearance_mode == 'gaussian-rgb' else None,
               'adversarial_gradient_norm_first_step': history[step]['adversarial_gradient_norm'],
-              'hu_below_range': int((scene.hu < lut.hu_bounds[0, 0]).sum()),
-              'hu_above_range': int((scene.hu > lut.hu_bounds[0, 1]).sum()),
+              'hu_below_range': int((scene.hu < lut.hu_bounds[0, 0]).sum()) if args.appearance_mode == 'lut' else None,
+              'hu_above_range': int((scene.hu > lut.hu_bounds[0, 1]).sum()) if args.appearance_mode == 'lut' else None,
               'checkpoint': last_checkpoint.name, 'last_losses': history[-1],
               'elapsed_seconds_this_run': time.monotonic()-run_started,
               'interpretation': 'Loss/gradient validation does not establish realism or cross-patient generalization. '
                                 'Patch pixel size is fixed but physical scale and exposure remain uncalibrated. '
-                                'Selected LUT uses linear RGB; historical SH context colorimetry is unverified.'}
+                                'Selected appearance uses linear RGB; historical SH context colorimetry is unverified. '
+                                'Independent RGB does not ensure plausible texture; unseen Gaussians may remain at initialization.'}
     (args.output/'report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     print(json.dumps(report, indent=2), flush=True)
 

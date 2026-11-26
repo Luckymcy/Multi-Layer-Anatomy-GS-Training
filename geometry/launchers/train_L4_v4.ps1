@@ -11,9 +11,9 @@ if (-not $Workspace) {
     $Workspace = Split-Path -Parent $Repo
 }
 $Source = Join-Path $Workspace "data\ct\teachers\v4\L4"
-$PreviousLayer = Join-Path $Workspace "output\L3_v3\layer_save_30000.pth"
+$PreviousLayer = Join-Path $Workspace "output/geometry/L3\layer_save_30000.pth"
 if (-not $Output) {
-    $Output = Join-Path $Workspace "output\L4_v4"
+    $Output = Join-Path $Workspace "output/geometry/L4_v4"
 }
 
 foreach ($RequiredPath in @($Python, $Repo, $Source, $PreviousLayer)) {
